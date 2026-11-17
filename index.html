@@ -76,7 +76,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
 .core.armed .ring-inner{stroke:rgba(0,229,255,.55)}
 @keyframes armPulse{50%{box-shadow:0 0 38px rgba(0,229,255,.42),0 0 90px rgba(30,110,255,.26),inset 0 0 50px rgba(0,229,255,.12)}}
 .cta.stop{box-shadow:0 0 22px rgba(255,80,110,.25)}
-.term{width:100%;margin-top:12px;height:150px;overflow:hidden;background:rgba(0,0,0,.45);border:1px solid var(--line);border-radius:12px;padding:8px 10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.55;display:flex;flex-direction:column;justify-content:flex-end}
+.term{width:100%;margin-top:12px;height:250px;overflow:hidden;background:rgba(0,0,0,.45);border:1px solid var(--line);border-radius:12px;padding:8px 10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;line-height:1.55;display:flex;flex-direction:column;justify-content:flex-end}
 .term div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;animation:ln .25s ease-out}
 @keyframes ln{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
 .term .rd{color:var(--cyan)} .term .ca{color:#b79cff} .term .mp{color:var(--warn)} .term .hn{color:var(--mute)} .term .ok{color:var(--buy)} .term .no{color:#6b7694} .term .bd{color:var(--sell)}
@@ -182,6 +182,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
       <div><b id="sR">--</b><span>Win rate</span></div>
     </div>
     <div class="row">Payout % <input id="payout" type="number" value="85" min="50" max="100"> <span id="be"></span></div>
+    <div class="row">Signals today <b id="sToday">0</b> / 240</div>
     <div class="verdict" id="verdict"></div>
     <div class="label" style="margin-top:14px">Win rate by timeframe</div>
     <div id="byExp" style="font-size:12px;line-height:1.9;opacity:.9"></div>
@@ -195,7 +196,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
     <div class="tools"><button id="exportBtn">Export CSV</button><button id="resetBtn">Reset log</button></div>
   </div>
 
-  <div class="foot">Signals are a test hypothesis, not financial advice. EMA, liquidity-sweep and RSI signals are not proven to predict price, and Deriv's volatility indices are random by design. Trust your win-rate log, not the animation. Binary options carry a high risk of loss.</div>
+  <div class="foot">Signals are a test hypothesis, not financial advice. Fractal, Bollinger and RSI signals are not proven to predict price, and Deriv's volatility indices are random by design. Trust your win-rate log, not the animation. Binary options carry a high risk of loss.</div>
 </div>
 
 <div class="ov" id="ov"><div class="rc" id="rc"></div></div>
@@ -219,8 +220,10 @@ const POOL = [
   {s:'1HZ100V',l:'VOL100',d:2},{s:'1HZ75V',l:'VOL75',d:2},{s:'1HZ50V',l:'VOL50',d:2},
   {s:'1HZ25V',l:'VOL25',d:2},{s:'1HZ10V',l:'VOL10',d:2}
 ];
-const TFS = [{m:1,l:'1m'}];   // strategy trades 1-minute expiry only
-const CYCLE = 60000, PRE = 22000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 220;
+const TFS = [{m:1,l:'1m'},{m:2,l:'2m'},{m:3,l:'3m'}];   // the bot picks 1, 2 or 3 minutes per signal
+const MAXMK = 11;   // scan every real forex pair in the pool, not just 6
+const DAILY_TARGET = 240;
+const CYCLE = 60000, PRE = 40000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 220;
 /* Hosted Pocket backends use ?pocket_ws=wss://...; local testing uses python server.py. */
 const remotePocketWs = new URLSearchParams(location.search).get('pocket_ws');
 let validRemotePocketWs = '';
@@ -281,17 +284,18 @@ function aggAt(c1,tf,Bsec){
   return out;
 }
 
-/* ---------- Strategy: Liquidity Sweep Trend Continuation (EMA 9/21/200 + 3-bar sweep + RSI 14). Closed 1m candles only. ---------- */
+/* ---------- Strategy: Fractal Structure + Bollinger Pullback (HH/HL or LH/LL + Bollinger middle band + RSI 14). Closed 1m candles only. ---------- */
 const F=(p,v)=>v==null||!isFinite(v)?'--':v.toFixed(p.d);
-const EMA_F=9, EMA_M=21, EMA_T=200, RSI_N=14, ATR_N=14, SWEEP_N=3, SLOPE_N=2, RANGE_N=10, RANGE_X=3;
+const BB_N=20, BB_K=2, RSI_N=14, FR=2, SWING_MAX_AGE=60, PB_ZONE=0.2;   // PB_ZONE: how far past the middle band (as a share of the way to the outer band) still counts as a pullback
 /* AUTO_LOG: when true, a finished signal is scored automatically from the feed price at expiry (no popup), so scanning never waits for you.
    It scores the Deriv price, not your broker's price. Set false to tap Profit/Loss yourself after every signal. */
 const AUTO_LOG=true;
-/* EMA series on candle closes (alpha = 2/(n+1), seeded with the first close, same as pandas ewm(adjust=False)) */
-function emaSeries(C,n){
-  const a=2/(n+1), out=new Array(C.length); let e=null;
-  for(let i=0;i<C.length;i++){ e=e===null?C[i].c:a*C[i].c+(1-a)*e; out[i]=e; }
-  return out;
+/* Bollinger Bands on candle closes (population std-dev) */
+function bb(C,n=BB_N,k=BB_K){
+  if(C.length<n) return null;
+  const s=C.slice(-n); let m=0; s.forEach(x=>m+=x.c); m/=n;
+  let v=0; s.forEach(x=>v+=(x.c-m)*(x.c-m)); const sd=Math.sqrt(v/n);
+  return {mid:m,up:m+k*sd,lo:m-k*sd};
 }
 /* RSI the way pandas_ta computes it: Wilder smoothing = ewm(alpha=1/n, adjust=False) over up/down moves */
 function rsi(C,n=RSI_N){
@@ -303,87 +307,104 @@ function rsi(C,n=RSI_N){
   }
   return (g+l)===0?50:100*g/(g+l);
 }
-/* Average true range (Wilder). Shown in the log only, no rule uses it. */
-function atr(C,n=ATR_N){
-  if(C.length<n+1) return null;
-  let a=null;
-  for(let i=1;i<C.length;i++){
-    const tr=Math.max(C[i].h-C[i].l,Math.abs(C[i].h-C[i-1].c),Math.abs(C[i].l-C[i-1].c));
-    a=a===null?tr:(a*(n-1)+tr)/n;
+/* Fractals (Williams): a swing HIGH is a candle whose high is above the FR candles before AND the FR candles after it.
+   It is only confirmed FR candles later, so the newest candles can never create a swing = no repainting. */
+function swings(C){
+  const H=[],L=[], n=C.length;
+  for(let k=Math.max(FR,n-250); k<=n-1-FR; k++){
+    let hi=true, lo=true;
+    for(let j=1;j<=FR;j++){
+      if(!(C[k].h>C[k-j].h&&C[k].h>C[k+j].h)) hi=false;
+      if(!(C[k].l<C[k-j].l&&C[k].l<C[k+j].l)) lo=false;
+    }
+    if(hi) H.push({i:k,v:C[k].h});
+    if(lo) L.push({i:k,v:C[k].l});
   }
-  return a;
+  return {H,L};
 }
-/* CALL (all 10 must be true on the completed signal candle):
-    1 close > EMA200   2 EMA9 > EMA21   3 EMA9 > EMA9 2 candles ago   4 EMA21 > EMA21 2 candles ago
-    5 low sweeps below the lowest low of the previous 3 candles   6 close back above that swept level
-    7 bullish candle   8 RSI > 50   9 RSI rising vs previous candle   10 range <= 3x average range of the previous 10 candles
-   PUT = the exact mirror. Only completed candles are used, nothing looks ahead, nothing is shifted back.
-   Entry reference = next candle open; the app enters at the live price when the signal appears. Expiry = 60 seconds. */
+/* Market structure from the last confirmed swings: HH+HL = uptrend, LH+LL = downtrend */
+function structure(C){
+  const {H,L}=swings(C), n=C.length;
+  if(H.length<2||L.length<2) return null;
+  const h1=H[H.length-1], h0=H[H.length-2], l1=L[L.length-1], l0=L[L.length-2];
+  const up3=H.length>=3&&L.length>=3&&H[H.length-1].v>H[H.length-2].v&&H[H.length-2].v>H[H.length-3].v&&L[L.length-1].v>L[L.length-2].v&&L[L.length-2].v>L[L.length-3].v;
+  const dn3=H.length>=3&&L.length>=3&&H[H.length-1].v<H[H.length-2].v&&H[H.length-2].v<H[H.length-3].v&&L[L.length-1].v<L[L.length-2].v&&L[L.length-2].v<L[L.length-3].v;
+  return {h0,h1,l0,l1, hh:h1.v>h0.v, hl:l1.v>l0.v, lh:h1.v<h0.v, ll:l1.v<l0.v,
+          up:h1.v>h0.v&&l1.v>l0.v, down:h1.v<h0.v&&l1.v<l0.v, up3, dn3, fresh:(n-1-Math.max(h1.i,l1.i))<=SWING_MAX_AGE};
+}
+/* CALL (all 10 true on the completed signal candle):
+    1 higher high (HH)   2 higher low (HL)   3 swings are recent   4 pullback reached the Bollinger middle zone (middle band + 20% toward the outer band)
+    5 closed back above the middle band   6 pullback stayed above the last swing low   7 bullish candle
+    8 RSI > 50   9 RSI rising   10 candle range no wider than the Bollinger band
+   PUT = the exact mirror (LH, LL, bounce down off the middle band, bearish candle, RSI < 50 and falling).
+   Only completed candles are used, nothing looks ahead, nothing is shifted back. */
 function evaluateSetup(C1,p,C5){
   const o={valid:false,miss:[],why:[],signal:'WAIT'};
   const n=C1.length;
   if(n<MIN_C){ o.miss.push('not enough candles'); return o; }
-  const last=C1[n-1], prev=C1[n-2];
-  const e9=emaSeries(C1,EMA_F), e21=emaSeries(C1,EMA_M), e200=emaSeries(C1,EMA_T);
-  const R=rsi(C1), Rp=rsi(C1.slice(0,-1));
-  if(R==null||Rp==null){ o.miss.push('not enough candles for RSI'); return o; }
+  const last=C1[n-1], B=bb(C1), R=rsi(C1), Rp=rsi(C1.slice(0,-1)), S=structure(C1);
+  if(!B||R==null||Rp==null){ o.miss.push('not enough candles for indicators'); return o; }
   o.rsi=R;
-  const i=n-1;
-  const pre5=C1.slice(n-1-SWEEP_N,n-1), loLvl=Math.min(...pre5.map(x=>x.l)), hiLvl=Math.max(...pre5.map(x=>x.h));
-  const pre10=C1.slice(n-1-RANGE_N,n-1), avgRange=pre10.reduce((t,x)=>t+(x.h-x.l),0)/RANGE_N;
-  const range=last.h-last.l, calm=range<=RANGE_X*avgRange;
+  if(!S){ o.miss.push('no clear swings yet'); return o; }
+  const width=B.up-B.lo, range=last.h-last.l, calm=range<=width;
   const call=[
-    ['close above EMA200', last.c>e200[i]],
-    ['EMA9 above EMA21', e9[i]>e21[i]],
-    ['EMA9 not rising', e9[i]>e9[i-SLOPE_N]],
-    ['EMA21 not rising', e21[i]>e21[i-SLOPE_N]],
-    ['no sweep below 3-bar low', last.l<loLvl],
-    ['did not close back above swept level', last.c>loLvl],
+    ['no higher high (HH)', S.hh],
+    ['no higher low (HL)', S.hl],
+    ['swings too old', S.fresh],
+    ['no pullback to Bollinger middle', last.l<=B.mid+PB_ZONE*(B.up-B.mid)],
+    ['did not close back above middle', last.c>B.mid],
+    ['pullback broke the last swing low', last.l>S.l1.v],
     ['candle not bullish', last.c>last.o],
     ['RSI not above 50', R>50],
     ['RSI not rising', R>Rp],
-    ['candle range too large', calm]
+    ['candle wider than the Bollinger band', calm]
   ];
   const put=[
-    ['close below EMA200', last.c<e200[i]],
-    ['EMA9 below EMA21', e9[i]<e21[i]],
-    ['EMA9 not falling', e9[i]<e9[i-SLOPE_N]],
-    ['EMA21 not falling', e21[i]<e21[i-SLOPE_N]],
-    ['no sweep above 3-bar high', last.h>hiLvl],
-    ['did not close back below swept level', last.c<hiLvl],
+    ['no lower high (LH)', S.lh],
+    ['no lower low (LL)', S.ll],
+    ['swings too old', S.fresh],
+    ['no pullback to Bollinger middle', last.h>=B.mid-PB_ZONE*(B.mid-B.lo)],
+    ['did not close back below middle', last.c<B.mid],
+    ['pullback broke the last swing high', last.h<S.h1.v],
     ['candle not bearish', last.c<last.o],
     ['RSI not below 50', R<50],
     ['RSI not falling', R<Rp],
-    ['candle range too large', calm]
+    ['candle wider than the Bollinger band', calm]
   ];
   const cOK=call.every(x=>x[1]), pOK=put.every(x=>x[1]);
   if(cOK) o.dir='BUY'; else if(pOK) o.dir='SELL';
   else {
-    /* report the side that got furthest, with its first failed rule */
     const cp=call.filter(x=>x[1]).length, pp=put.filter(x=>x[1]).length;
     const side=cp>=pp?'CALL':'PUT', rules=cp>=pp?call:put, pass=Math.max(cp,pp);
-    const bad=rules.find(x=>!x[1]);
-    o.miss.push(`${side} ${pass}/10 rules · ${bad[0]}`); return o;
+    o.miss.push(`${side} ${pass}/10 rules · ${rules.find(x=>!x[1])[0]}`); return o;
   }
-  const isBuy=o.dir==='BUY', lvl=isBuy?loLvl:hiLvl;
-  o.kind=1; o.type='Liquidity Sweep Trend'; o.tf=TFS[0]; o.signal=isBuy?'BUY (CALL)':'SELL (PUT)'; o.valid=true;
-  const ext=Math.abs(R-50);                                   // momentum strength, used only to rank several valid markets
+  const isBuy=o.dir==='BUY';
+  /* expiry: 1 point each for (a) 5m swing structure pointing the same way, (b) 3 rising/falling swings in a row on 1m, (c) RSI beyond 60/40.
+     0-1 points = 1 minute, 2 points = 2 minutes, 3 points = 3 minutes. The 'Win rate by timeframe' panel shows which expiry really works. */
+  let pts=0, al5=false;
+  if(C5&&C5.length>=30){ const S5=structure(C5); al5=!!S5&&(isBuy?S5.up:S5.down); if(al5) pts++; }
+  const run3=isBuy?S.up3:S.dn3; if(run3) pts++;
+  const strongRsi=isBuy?R>=60:R<=40; if(strongRsi) pts++;
+  const mins=pts>=3?3:pts===2?2:1;
+  o.kind=1; o.type='Fractal Bollinger Pullback'; o.tf=TFS[mins-1]; o.signal=isBuy?'BUY (CALL)':'SELL (PUT)'; o.valid=true;
+  const ext=Math.abs(R-50);
   o.rank=ext;
   o.score=Math.max(5,Math.min(100,Math.round(50+ext)));       // bar length only, not a win probability
-  o.why.push('Setup: Liquidity Sweep Trend Continuation');
-  o.why.push(isBuy?`Uptrend: close ${F(p,last.c)} above EMA200 ${F(p,e200[i])}, EMA9 above EMA21 and both rising`:`Downtrend: close ${F(p,last.c)} below EMA200 ${F(p,e200[i])}, EMA9 below EMA21 and both falling`);
-  o.why.push(isBuy?`Swept the 3-bar low ${F(p,lvl)} (wick to ${F(p,last.l)}) and closed back above it, bullish candle`:`Swept the 3-bar high ${F(p,lvl)} (wick to ${F(p,last.h)}) and closed back below it, bearish candle`);
-  o.why.push(`RSI(${RSI_N}) ${R.toFixed(1)} and ${isBuy?'rising':'falling'} · range ${(range/avgRange).toFixed(1)}x the 10-bar average`);
+  o.why.push('Setup: Fractal Structure + Bollinger Pullback');
+  o.why.push(isBuy?`Uptrend structure: swing highs ${F(p,S.h0.v)} → ${F(p,S.h1.v)} (HH), swing lows ${F(p,S.l0.v)} → ${F(p,S.l1.v)} (HL)`:`Downtrend structure: swing highs ${F(p,S.h0.v)} → ${F(p,S.h1.v)} (LH), swing lows ${F(p,S.l0.v)} → ${F(p,S.l1.v)} (LL)`);
+  o.why.push(isBuy?`Pulled back to the Bollinger middle ${F(p,B.mid)} (low ${F(p,last.l)}) and closed back above it, bullish candle`:`Pushed up to the Bollinger middle ${F(p,B.mid)} (high ${F(p,last.h)}) and closed back below it, bearish candle`);
+  o.why.push(`RSI(${RSI_N}) ${R.toFixed(1)} and ${isBuy?'rising':'falling'}`);
+  o.why.push(`Expiry ${mins} min: 5m structure ${al5?'agrees':'not confirmed'} · 3-swing run ${run3?'yes':'no'} · RSI ${strongRsi?'strong':'normal'} (${pts}/3)`);
   return o;
 }
 
-/* ---------- Markets / mkTop 6 ---------- */
+/* ---------- Markets (all live pairs, up to MAXMK) ---------- */
 let mkTop=[];
 const fresh = s=>lastTickAt[s]&&Date.now()-lastTickAt[s]<8000;
 function refreshTop(){
   const settling = wsOk && Date.now()-openedAt<6000;
   const keep = settling ? [] : mkTop.filter(p=>p.ok!==false&&fresh(p.s));
-  for(const p of POOL){ if(keep.length>=6) break; if(p.ok!==false&&fresh(p.s)&&!keep.includes(p)) keep.push(p); }
+  for(const p of POOL){ if(keep.length>=MAXMK) break; if(p.ok!==false&&fresh(p.s)&&!keep.includes(p)) keep.push(p); }
   keep.sort((a,b)=>POOL.indexOf(a)-POOL.indexOf(b));
   mkTop=keep;
 }
@@ -398,7 +419,7 @@ function spark(sym){
 const prevP={};
 function renderMarkets(){
   let h='';
-  for(let k=0;k<6;k++){
+  for(let k=0;k<MAXMK;k++){
     const p=mkTop[k];
     if(!p){ h+=`<div class="mk empty"><b>--</b><div class="p">waiting</div></div>`; continue; }
     const px=lastPrice[p.s], pp=prevP[p.s]; const cls=pp!=null&&px!==pp?(px>pp?'up':'dn'):(document.__c&&document.__c[p.s]||'');
@@ -471,26 +492,26 @@ let autoOn=false, scan=null, lastB=0, curSig=null, audio=null;
 const term=$('term'), CIRC=2*Math.PI*100;
 function say(c,t){
   const d=document.createElement('div'); d.className=c; d.textContent=t; term.appendChild(d);
-  while(term.children.length>9) term.removeChild(term.firstChild);
+  while(term.children.length>15) term.removeChild(term.firstChild);
 }
 function intel(p,cut){
   const C=aggAt(cdl[p.s]||[],1,cut), n=C.length;
   if(n<MIN_C) return [{c:'rd',t:`READ  ${p.l} · ${n}/${MIN_C} candles, still collecting data`}];
   const C5=aggAt(cdl[p.s]||[],5,cut);
-  const r=C[n-1].c, R=rsi(C), A=atr(C), e9=emaSeries(C,EMA_F), e21=emaSeries(C,EMA_M), e200=emaSeries(C,EMA_T), k=n-1;
+  const r=C[n-1].c, R=rsi(C), B=bb(C), S=structure(C);
+  const past=C.slice(-6).map(c=>c.c>=c.o?'▲':'▼').join('');
+  const tag=!S?'no swings yet':S.up?'UPTREND HH+HL':S.down?'DOWNTREND LH+LL':(S.hh?'HH':'LH')+'+'+(S.hl?'HL':'LL')+' mixed';
   return [
-    {c:'rd',t:`READ  ${p.l} · ${n} 1m candles · price ${F(p,r)}`},
-    {c:'ca',t:`CALC  EMA9 ${F(p,e9[k])} · EMA21 ${F(p,e21[k])} · EMA200 ${F(p,e200[k])}`},
-    {c:'ca',t:`CALC  RSI(${RSI_N}) ${R==null?'--':R.toFixed(1)} · ATR(${ATR_N}) ${A==null?'--':F(p,A)}`},
-    {c:'hn',t:`HUNT  trend + 3-bar liquidity sweep + RSI 50 + calm candle`}
+    {c:'rd',t:`READ  ${p.l} ${F(p,r)} · last 6 candles ${past} · RSI ${R==null?'--':R.toFixed(0)}`},
+    {c:'ca',t:`CHECK ${p.l} ${tag}${S?' · swing H '+F(p,S.h1.v)+' L '+F(p,S.l1.v):''} · BB mid ${B?F(p,B.mid):'--'}`}
   ];
 }
 function beginScan(B){
   const mk=mkTop.slice(), slot=PRE/Math.max(1,mk.length), items=[];
   items.push({at:0,c:'hn',t:`SCAN  ${mk.length} markets · signal at ${new Date(B).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}`});
   const cut=Math.floor(sNow()/60000)*60;
-  mk.forEach((p,k)=>{ intel(p,cut).forEach((x,q)=>items.push({at:700+k*slot+q*slot*0.22,c:x.c,t:x.t,sym:p.s})); });
-  items.push({at:PRE-300,c:'hn',t:'WAIT  candle closing… checking every pattern'});
+  mk.forEach((p,k)=>{ intel(p,cut).forEach((x,q)=>items.push({at:700+k*slot+q*slot*0.45,c:x.c,t:x.t,sym:p.s})); });
+  items.push({at:PRE-300,c:'hn',t:'WAIT  candle closing… final check on the closed candle'});
   scan={B,mk,slot,items,done:0};
   lastB=B; mk.forEach(p=>mstat[p.s]={t:'scanning',c:'w'}); hitSym=null; term.innerHTML=''; haptic('warning');
   $('radar').classList.add('scanning'); $('big').className='big scn';
@@ -502,28 +523,38 @@ function finalize(){
     const c1=cdl[p.s]||[], C1=aggAt(c1,1,Bsec), C5=aggAt(c1,5,Bsec);
     if(!C1.length||C1[C1.length-1].t!==Bsec-60){ mstat[p.s]={t:'no data',c:''}; why[p.s]='no candle for this minute'; return; }
     const r=evaluateSetup(C1,p,C5);
-    if(r.valid){ res.push({p,tf:r.tf,r}); mstat[p.s]={t:r.dir+' SWEEP',c:r.dir==='BUY'?'b':'s'}; }
+    if(r.valid){ res.push({p,tf:r.tf,r}); mstat[p.s]={t:r.dir,c:r.dir==='BUY'?'b':'s'}; }
     else { mstat[p.s]={t:'wait',c:''}; why[p.s]=r.miss[0]||'conditions not met'; }
   });
   const valid=res.slice().sort((a,b)=>b.r.rank-a.r.rank);
+  term.innerHTML=''; say('hn',`RESULT  candle closed ${new Date(B).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} · ${res.length} signal${res.length===1?'':'s'} from ${scan.mk.length} pairs`);
   scan.mk.forEach(p=>{ const x=res.find(y=>y.p===p);
     if(x) say('ok',`✔ ${p.l} ${x.r.signal} · ${x.r.type} · RSI ${x.r.rsi.toFixed(0)}`);
     else say('no',`– ${p.l} WAIT · ${why[p.s]||'no setup'}`); });
   $('radar').classList.remove('scanning'); $('big').className='big'; actSym=null;
-  if(valid.length) emitSignal(valid[0]); else showNone(res,why);
+  if(valid.length) emitSignals(valid); else showNone(res,why);
   scan=null;
 }
-function emitSignal(b){
-  const p=b.p, now=sNow(), entry=lastPrice[p.s];
-  const rec={id:Date.now(),s:p.s,l:p.l,d:p.d,dir:b.r.dir,entry,rsi:b.r.rsi,type:b.r.type,str:b.r.score/100,at:now,exp:now+b.tf.m*60000,expLabel:b.tf.l,st:'pending'};
-  log.unshift(rec); saveLog(); renderAll(); curSig=rec; hitSym=p.s;
+function emitSignals(list){
+  const now=sNow(), recs=[];
+  list.forEach((b,k)=>{
+    const p=b.p;
+    if(pending().some(r=>r.s===p.s)) return;                 // one open trade per pair at a time
+    const entry=lastPrice[p.s];
+    const rec={id:Date.now()+k,s:p.s,l:p.l,d:p.d,dir:b.r.dir,entry,rsi:b.r.rsi,type:b.r.type,str:b.r.score/100,at:now,exp:now+b.tf.m*60000,expLabel:b.tf.l,st:'pending'};
+    log.unshift(rec); recs.push({rec,b});
+  });
+  if(!recs.length){ showNone([],{}); return; }
+  saveLog(); renderAll(); curSig=recs[0].rec; hitSym=recs[0].rec.s;
   const P=$('sigP'); P.style.display='block'; P.className='panel sigP';
-  P.innerHTML=`<div class="label">Signal<i>${new Date(now).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</i></div>
-   <div class="sg"><div class="sgdir ${rec.dir}">${rec.dir}</div><div class="sgmk">${p.l}<small>ENTER NOW</small></div></div>
-   <div class="meta"><div><b>${b.tf.l}</b><span>Expiry</span></div><div><b>${F(p,entry)}</b><span>Entry</span></div><div><b>${b.r.rsi.toFixed(0)}</b><span>RSI 14</span></div></div>
+  P.innerHTML=`<div class="label">${recs.length} signal${recs.length>1?'s':''}<i>${new Date(now).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})}</i></div>`+
+  recs.map(({rec,b})=>{ const p=b.p; return `<div style="padding:8px 0;border-top:1px solid var(--line)">
+   <div class="sg"><div class="sgdir ${rec.dir}">${rec.dir}</div><div class="sgmk">${p.l}<small>ENTER NOW · ${b.tf.l}</small></div></div>
+   <div class="meta"><div><b>${b.tf.l}</b><span>Expiry</span></div><div><b>${F(p,rec.entry)}</b><span>Entry</span></div><div><b>${b.r.rsi.toFixed(0)}</b><span>RSI 14</span></div></div>
    <div class="bar"><i style="width:${b.r.score}%"></i></div>
-   <ul class="why">${b.r.why.map(w=>`<li>${w}</li>`).join('')}</ul><div class="expl" id="sigExp"></div>`;
-  void P.offsetWidth; P.classList.add('in'); haptic('success'); beep(rec.dir==='BUY'?[660,880]:[880,520]);
+   <div class="expl sigx" data-exp="${rec.exp}"></div>
+   <details><summary style="font-size:12px;opacity:.7;cursor:pointer">Why</summary><ul class="why">${b.r.why.map(w=>`<li>${w}</li>`).join('')}</ul></details></div>`; }).join('');
+  void P.offsetWidth; P.classList.add('in'); haptic('success'); beep(recs[0].rec.dir==='BUY'?[660,880]:[880,520]);
   try{ P.scrollIntoView({behavior:'smooth',block:'nearest'}); }catch(e){}
 }
 function showNone(res,why){
@@ -531,7 +562,7 @@ function showNone(res,why){
   const rows=(scan?scan.mk:[]).map(p=>`<li>${p.l}: ${(why&&why[p.s])||'WAIT'}</li>`).join('');
   const P=$('sigP'); P.style.display='block'; P.className='panel sigP';
   P.innerHTML=`<div class="label">This round</div><div class="sg"><div class="sgdir NO">NO SIGNAL FOUND</div></div>
-   <div style="font-size:13px;color:var(--mute);line-height:1.45">Nothing matched the strategy exactly, so the bot is staying out. Next scan in 1 minute.</div>
+   <div style="font-size:13px;color:var(--mute);line-height:1.45">Nothing matched the strategy exactly. Next scan in 1 minute.</div>
    <ul class="why">${rows}</ul>`;
   void P.offsetWidth; P.classList.add('in'); haptic('error');
 }
@@ -541,8 +572,8 @@ setInterval(()=>{
   const now=sNow();
   if(autoOn&&wsOk&&mkTop.length){
     const B=Math.ceil((now-POST)/CYCLE)*CYCLE;
-    /* one trade at a time: no new scan or signal while the latest signal is still open or waiting for your answer */
-    const act=pending().sort((a,b)=>a.exp-b.exp)[0], busy=!!(act||modalRec);
+    /* signals can overlap: scanning continues every minute while earlier trades are open. Only the manual result popup pauses it. */
+    const act=pending().sort((a,b)=>a.exp-b.exp)[0], busy=!!modalRec;
     if(busy&&!wasBusy) say('hn','HOLD  signal in progress. Next scan starts after it ends.');
     if(!busy&&wasBusy) say('hn','FREE  trade finished. Scanning resumes.');
     wasBusy=busy;
@@ -564,13 +595,13 @@ setInterval(()=>{
     $('big').textContent=!wsOk?'OFFLINE':!mkTop.length?'LOADING':'READY';
     $('subtxt').textContent=!wsOk?'Connecting':!mkTop.length?'Waiting for prices':'Tap start';
   }
-  if(curSig){ const e=$('sigExp'), left=(curSig.exp-now)/1000; if(e) e.textContent=left>0?'EXPIRES IN '+mmss(left):'EXPIRED · CONFIRM YOUR RESULT'; }
+  document.querySelectorAll('.sigx').forEach(e=>{ const left=(+e.dataset.exp-now)/1000; e.textContent=left>0?'EXPIRES IN '+mmss(left):'EXPIRED'; });
   renderMarkets();
 },500);
 $('go').onclick=()=>{
   autoOn=!autoOn; $('core').classList.toggle('armed',autoOn); document.body.classList.toggle('armed',autoOn); holo(autoOn); $('go').textContent=autoOn?'STOP AUTO SCAN':'START AUTO SCAN'; $('go').className='cta'+(autoOn?' stop':'');
   if(autoOn){ try{ audio=audio||new (window.AudioContext||window.webkitAudioContext)(); audio.resume&&audio.resume(); }catch(e){}
-    term.innerHTML=''; say('hn','AUTO  armed. Scanning starts 22s before every 1-minute candle close.'); haptic('warning'); }
+    term.innerHTML=''; say('hn','AUTO  armed. Scanning all pairs every minute. Signals use a 1, 2 or 3 minute expiry.'); haptic('warning'); }
   else { scan=null; actSym=null; $('radar').classList.remove('scanning'); say('hn','AUTO  paused.'); }
 };
 function beep(f){ try{ if(!audio) return; f.forEach((hz,k)=>{ const o=audio.createOscillator(), g=audio.createGain(); o.frequency.value=hz; o.type='sine'; o.connect(g); g.connect(audio.destination);
@@ -621,7 +652,7 @@ function burst(x,y,col,n){
 
 function renderStats(){
   const dn=log.filter(r=>r.st==='win'||r.st==='loss'), w=dn.filter(r=>r.st==='win').length, l=dn.length-w;
-  $('sN').textContent=log.length; $('sW').textContent=w; $('sL').textContent=l;
+  $('sToday').textContent=log.filter(r=>new Date(r.at).toDateString()===new Date().toDateString()).length; $('sN').textContent=log.length; $('sW').textContent=w; $('sL').textContent=l;
   const wr=dn.length?w/dn.length*100:null; $('sR').textContent=wr==null?'--':wr.toFixed(1)+'%';
   const pay=Math.max(50,Math.min(100,+$('payout').value||85)), be=100/(1+pay/100);
   $('be').textContent='Break-even: '+be.toFixed(1)+'%';
@@ -632,7 +663,7 @@ function renderStats(){
       :wr>be?`<strong>Above break-even but not proven</strong> (95% low bound ${lo.toFixed(1)}%). Keep collecting data.`
       :`<strong>Below break-even.</strong> At this payout this strategy loses money. Change the logic or stop.`; }
   $('verdict').innerHTML=v;
-  $('byType').innerHTML=[['Liquidity sweep',/^Liquidity Sweep/]].map(([nm,re])=>{ const x=dn.filter(r=>re.test(r.type||'')), xw=x.filter(r=>r.st==='win').length;
+  $('byType').innerHTML=[['Fractal pullback',/^Fractal/]].map(([nm,re])=>{ const x=dn.filter(r=>re.test(r.type||'')), xw=x.filter(r=>r.st==='win').length;
     const rt=x.length?(xw/x.length*100).toFixed(1)+'%':'--', note=x.length&&x.length<30?' <i>(too few)</i>':'';
     return `<div style="display:flex;justify-content:space-between"><span>${nm}</span><span>${xw}/${x.length} &nbsp; <b>${rt}</b>${note}</span></div>`; }).join('');
   $('byExp').innerHTML=TFS.map(e=>{ const x=dn.filter(r=>r.expLabel===e.l), xw=x.filter(r=>r.st==='win').length;
