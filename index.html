@@ -221,7 +221,7 @@ const POOL = [
   {s:'1HZ25V',l:'VOL25',d:2},{s:'1HZ10V',l:'VOL10',d:2}
 ];
 const TFS = [{m:1,l:'1m'},{m:2,l:'2m'},{m:3,l:'3m'}];   // the bot picks 1, 2 or 3 minutes per signal
-const MAXMK = 11;   // scan every real forex pair in the pool, not just 6
+const MAXMK = 6;   // scan 6 pairs (the first 6 live pairs in POOL; the rest are only backups)
 const DAILY_TARGET = 240;
 const CYCLE = 60000, PRE = 40000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 220;
 /* Hosted Pocket backends use ?pocket_ws=wss://...; local testing uses python server.py. */
@@ -286,7 +286,7 @@ function aggAt(c1,tf,Bsec){
 
 /* ---------- Strategy: Fractal Structure + Bollinger Pullback (HH/HL or LH/LL + Bollinger middle band + RSI 14). Closed 1m candles only. ---------- */
 const F=(p,v)=>v==null||!isFinite(v)?'--':v.toFixed(p.d);
-const BB_N=20, BB_K=2, RSI_N=14, FR=2, SWING_MAX_AGE=60, PB_ZONE=0.2;   // PB_ZONE: how far past the middle band (as a share of the way to the outer band) still counts as a pullback
+const BB_N=20, BB_K=2, RSI_N=14, FR=2, SWING_MAX_AGE=60, PB_ZONE=0.3;   // PB_ZONE: how far past the middle band (as a share of the way to the outer band) still counts as a pullback
 /* AUTO_LOG: when true, a finished signal is scored automatically from the feed price at expiry (no popup), so scanning never waits for you.
    It scores the Deriv price, not your broker's price. Set false to tap Profit/Loss yourself after every signal. */
 const AUTO_LOG=true;
@@ -333,7 +333,7 @@ function structure(C){
           up:h1.v>h0.v&&l1.v>l0.v, down:h1.v<h0.v&&l1.v<l0.v, up3, dn3, fresh:(n-1-Math.max(h1.i,l1.i))<=SWING_MAX_AGE};
 }
 /* CALL (all 10 true on the completed signal candle):
-    1 higher high (HH)   2 higher low (HL)   3 swings are recent   4 pullback reached the Bollinger middle zone (middle band + 20% toward the outer band)
+    1 higher high (HH)   2 higher low (HL)   3 swings are recent   4 pullback reached the Bollinger middle zone (middle band + 30% toward the outer band)
     5 closed back above the middle band   6 pullback stayed above the last swing low   7 bullish candle
     8 RSI > 50   9 RSI rising   10 candle range no wider than the Bollinger band
    PUT = the exact mirror (LH, LL, bounce down off the middle band, bearish candle, RSI < 50 and falling).
