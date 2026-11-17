@@ -223,7 +223,7 @@ const POOL = [
 const TFS = [{m:1,l:'1m'},{m:2,l:'2m'},{m:3,l:'3m'}];   // the bot picks 1, 2 or 3 minutes per signal
 const MAXMK = 6;   // scan 6 pairs (the first 6 live pairs in POOL; the rest are only backups)
 const DAILY_TARGET = 240;
-const CYCLE = 60000, PRE = 40000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 220;
+const CYCLE = 60000, PRE = 40000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 100;   // Bollinger(20) + RSI(14) + swings only need about 100 candles (EMA 200 is gone)
 /* Hosted Pocket backends use ?pocket_ws=wss://...; local testing uses python server.py. */
 const remotePocketWs = new URLSearchParams(location.search).get('pocket_ws');
 let validRemotePocketWs = '';
@@ -286,7 +286,7 @@ function aggAt(c1,tf,Bsec){
 
 /* ---------- Strategy: Fractal Structure + Bollinger Pullback (HH/HL or LH/LL + Bollinger middle band + RSI 14). Closed 1m candles only. ---------- */
 const F=(p,v)=>v==null||!isFinite(v)?'--':v.toFixed(p.d);
-const BB_N=20, BB_K=2, RSI_N=14, FR=2, SWING_MAX_AGE=60, PB_ZONE=0.3;   // PB_ZONE: how far past the middle band (as a share of the way to the outer band) still counts as a pullback
+const BB_N=20, BB_K=2, RSI_N=14, FR=2, SWING_MAX_AGE=60, PB_ZONE=0.45;   // PB_ZONE: how far past the middle band (as a share of the way to the outer band) still counts as a pullback
 /* AUTO_LOG: when true, a finished signal is scored automatically from the feed price at expiry (no popup), so scanning never waits for you.
    It scores the Deriv price, not your broker's price. Set false to tap Profit/Loss yourself after every signal. */
 const AUTO_LOG=true;
@@ -333,7 +333,7 @@ function structure(C){
           up:h1.v>h0.v&&l1.v>l0.v, down:h1.v<h0.v&&l1.v<l0.v, up3, dn3, fresh:(n-1-Math.max(h1.i,l1.i))<=SWING_MAX_AGE};
 }
 /* CALL (all 10 true on the completed signal candle):
-    1 higher high (HH)   2 higher low (HL)   3 swings are recent   4 pullback reached the Bollinger middle zone (middle band + 30% toward the outer band)
+    1 higher high (HH)   2 higher low (HL)   3 swings are recent   4 pullback reached the Bollinger middle zone (middle band + 45% toward the outer band)
     5 closed back above the middle band   6 pullback stayed above the last swing low   7 bullish candle
     8 RSI > 50   9 RSI rising   10 candle range no wider than the Bollinger band
    PUT = the exact mirror (LH, LL, bounce down off the middle band, bearish candle, RSI < 50 and falling).
@@ -476,15 +476,19 @@ function connect(){
   ws.onerror=()=>{ try{ws.close()}catch(e){} };
 }
 function subscribe(sym){ if(!wsOk||subscribed.has(sym)) return; ws.send(JSON.stringify({ticks:sym,subscribe:1})); subscribed.add(sym); }
+const histAt={};
 function startSubs(){
   if(resolved) return; resolved=true;
   POOL.filter(p=>p.ok!==false).forEach((p,i)=>setTimeout(()=>{
     if(!wsOk) return; subscribe(p.s);
-    ws.send(JSON.stringify({ticks_history:p.s,adjust_start_time:1,count:500,end:'latest',style:'candles',granularity:60}));
+    histAt[p.s]=Date.now(); ws.send(JSON.stringify({ticks_history:p.s,adjust_start_time:1,count:500,end:'latest',style:'candles',granularity:60}));
   },i*130));
 }
 setInterval(()=>{ if(wsOk) ws.send(JSON.stringify({ping:1})); },25000);
 setInterval(()=>{ if(wsOk&&openedAt&&Date.now()-openedAt>15000&&!Object.keys(lastTickAt).length){ lastErr='no prices, switching feed'; openedAt=Date.now(); try{ws.close()}catch(e){} } },3000);
+/* if a pair still has too little history a few seconds after connecting, ask the feed for it again */
+setInterval(()=>{ if(!wsOk||!resolved) return; POOL.forEach(p=>{ if(p.ok===false||!fresh(p.s)) return;
+  if((cdl[p.s]||[]).length<MIN_C+10&&Date.now()-(histAt[p.s]||0)>8000){ histAt[p.s]=Date.now(); try{ ws.send(JSON.stringify({ticks_history:p.s,adjust_start_time:1,count:500,end:'latest',style:'candles',granularity:60})); }catch(e){} } }); },4000);
 setInterval(()=>{ refreshTop(); setStatus(wsOk&&mkTop.length?'on':wsOk?'wait':'off'); },1000);
 
 /* ---------- Scanner (every 1 minute, aligned to candle close) ---------- */
@@ -496,7 +500,7 @@ function say(c,t){
 }
 function intel(p,cut){
   const C=aggAt(cdl[p.s]||[],1,cut), n=C.length;
-  if(n<MIN_C) return [{c:'rd',t:`READ  ${p.l} · ${n}/${MIN_C} candles, still collecting data`}];
+  if(n<MIN_C) return [{c:'rd',t:`LOAD  ${p.l} · history ${n}/${MIN_C} candles, loading from the feed`}];
   const C5=aggAt(cdl[p.s]||[],5,cut);
   const r=C[n-1].c, R=rsi(C), B=bb(C), S=structure(C);
   const past=C.slice(-6).map(c=>c.c>=c.o?'▲':'▼').join('');
@@ -532,7 +536,7 @@ function finalize(){
     if(x) say('ok',`✔ ${p.l} ${x.r.signal} · ${x.r.type} · RSI ${x.r.rsi.toFixed(0)}`);
     else say('no',`– ${p.l} WAIT · ${why[p.s]||'no setup'}`); });
   $('radar').classList.remove('scanning'); $('big').className='big'; actSym=null;
-  if(valid.length) emitSignals(valid); else showNone(res,why);
+  if(valid.length) emitSignals(valid.slice(0,1)); else showNone(res,why);
   scan=null;
 }
 function emitSignals(list){
@@ -572,8 +576,8 @@ setInterval(()=>{
   const now=sNow();
   if(autoOn&&wsOk&&mkTop.length){
     const B=Math.ceil((now-POST)/CYCLE)*CYCLE;
-    /* signals can overlap: scanning continues every minute while earlier trades are open. Only the manual result popup pauses it. */
-    const act=pending().sort((a,b)=>a.exp-b.exp)[0], busy=!!modalRec;
+    /* one trade at a time: no new scan or signal while the latest signal is still open or waiting for your answer */
+    const act=pending().sort((a,b)=>a.exp-b.exp)[0], busy=!!(act||modalRec);
     if(busy&&!wasBusy) say('hn','HOLD  signal in progress. Next scan starts after it ends.');
     if(!busy&&wasBusy) say('hn','FREE  trade finished. Scanning resumes.');
     wasBusy=busy;
@@ -601,7 +605,7 @@ setInterval(()=>{
 $('go').onclick=()=>{
   autoOn=!autoOn; $('core').classList.toggle('armed',autoOn); document.body.classList.toggle('armed',autoOn); holo(autoOn); $('go').textContent=autoOn?'STOP AUTO SCAN':'START AUTO SCAN'; $('go').className='cta'+(autoOn?' stop':'');
   if(autoOn){ try{ audio=audio||new (window.AudioContext||window.webkitAudioContext)(); audio.resume&&audio.resume(); }catch(e){}
-    term.innerHTML=''; say('hn','AUTO  armed. Scanning all pairs every minute. Signals use a 1, 2 or 3 minute expiry.'); haptic('warning'); }
+    term.innerHTML=''; say('hn','AUTO  armed. Scanning 6 pairs. One signal at a time (1, 2 or 3 minute expiry); the next scan starts after it ends.'); haptic('warning'); }
   else { scan=null; actSym=null; $('radar').classList.remove('scanning'); say('hn','AUTO  paused.'); }
 };
 function beep(f){ try{ if(!audio) return; f.forEach((hz,k)=>{ const o=audio.createOscillator(), g=audio.createGain(); o.frequency.value=hz; o.type='sine'; o.connect(g); g.connect(audio.destination);
