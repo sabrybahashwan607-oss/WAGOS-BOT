@@ -195,7 +195,7 @@ header{display:flex;align-items:center;justify-content:space-between;margin-bott
     <div class="tools"><button id="exportBtn">Export CSV</button><button id="resetBtn">Reset log</button></div>
   </div>
 
-  <div class="foot">Signals are a test hypothesis, not financial advice. Bollinger and RSI signals are not proven to predict price, and Deriv's volatility indices are random by design. Trust your win-rate log, not the animation. Binary options carry a high risk of loss.</div>
+  <div class="foot">Signals are a test hypothesis, not financial advice. EMA, liquidity-sweep and RSI signals are not proven to predict price, and Deriv's volatility indices are random by design. Trust your win-rate log, not the animation. Binary options carry a high risk of loss.</div>
 </div>
 
 <div class="ov" id="ov"><div class="rc" id="rc"></div></div>
@@ -220,7 +220,7 @@ const POOL = [
   {s:'1HZ25V',l:'VOL25',d:2},{s:'1HZ10V',l:'VOL10',d:2}
 ];
 const TFS = [{m:1,l:'1m'}];   // strategy trades 1-minute expiry only
-const CYCLE = 60000, PRE = 22000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 90;
+const CYCLE = 60000, PRE = 22000, POST = 2000, MIN_SAMPLE = 100, MIN_C = 220;
 /* Hosted Pocket backends use ?pocket_ws=wss://...; local testing uses python server.py. */
 const remotePocketWs = new URLSearchParams(location.search).get('pocket_ws');
 let validRemotePocketWs = '';
@@ -281,20 +281,17 @@ function aggAt(c1,tf,Bsec){
   return out;
 }
 
-/* ---------- Strategy: Band Rejection Reversal (Bollinger 20,2 + RSI 14) (no filters). Closed 1m candles only. ---------- */
+/* ---------- Strategy: Liquidity Sweep Trend Continuation (EMA 9/21/200 + 5-bar sweep + RSI 14). Closed 1m candles only. ---------- */
 const F=(p,v)=>v==null||!isFinite(v)?'--':v.toFixed(p.d);
-const BB_N=20, BB_K=2, RSI_N=14;
-/* Filters removed: every band-rejection + RSI setup is signalled. RSI levels below decide what counts as stretched. */
-const RSI_OS=38, RSI_OB=62;
+const EMA_F=9, EMA_M=21, EMA_T=200, RSI_N=14, ATR_N=14, SWEEP_N=5, SLOPE_N=3, RANGE_N=10, RANGE_X=2;
 /* AUTO_LOG: when true, a finished signal is scored automatically from the feed price at expiry (no popup), so scanning never waits for you.
    It scores the Deriv price, not your broker's price. Set false to tap Profit/Loss yourself after every signal. */
 const AUTO_LOG=true;
-/* Bollinger Bands on candle closes (population std-dev, same as pandas_ta) */
-function bb(C,n=BB_N,k=BB_K){
-  if(C.length<n) return null;
-  const s=C.slice(-n); let m=0; s.forEach(x=>m+=x.c); m/=n;
-  let v=0; s.forEach(x=>v+=(x.c-m)*(x.c-m)); const sd=Math.sqrt(v/n);
-  return {mid:m,up:m+k*sd,lo:m-k*sd};
+/* EMA series on candle closes (alpha = 2/(n+1), seeded with the first close, same as pandas ewm(adjust=False)) */
+function emaSeries(C,n){
+  const a=2/(n+1), out=new Array(C.length); let e=null;
+  for(let i=0;i<C.length;i++){ e=e===null?C[i].c:a*C[i].c+(1-a)*e; out[i]=e; }
+  return out;
 }
 /* RSI the way pandas_ta computes it: Wilder smoothing = ewm(alpha=1/n, adjust=False) over up/down moves */
 function rsi(C,n=RSI_N){
@@ -306,8 +303,8 @@ function rsi(C,n=RSI_N){
   }
   return (g+l)===0?50:100*g/(g+l);
 }
-/* Average true range (Wilder) */
-function atr(C,n=14){
+/* Average true range (Wilder). Shown in the log only, no rule uses it. */
+function atr(C,n=ATR_N){
   if(C.length<n+1) return null;
   let a=null;
   for(let i=1;i<C.length;i++){
@@ -316,45 +313,67 @@ function atr(C,n=14){
   }
   return a;
 }
-/* ADX (Wilder). Low = ranging market (good for reversals), high = trending market (bad for reversals) */
-function adx(C,n=14){
-  if(C.length<2*n) return null;
-  const al=1/n; let st=null,sp=null,sm=null,ax=null;
-  for(let i=1;i<C.length;i++){
-    const up=C[i].h-C[i-1].h, dn=C[i-1].l-C[i].l;
-    const pdm=(up>dn&&up>0)?up:0, mdm=(dn>up&&dn>0)?dn:0;
-    const tr=Math.max(C[i].h-C[i].l,Math.abs(C[i].h-C[i-1].c),Math.abs(C[i].l-C[i-1].c));
-    if(st===null){ st=tr; sp=pdm; sm=mdm; } else { st=al*tr+(1-al)*st; sp=al*pdm+(1-al)*sp; sm=al*mdm+(1-al)*sm; }
-    const pdi=st>0?100*sp/st:0, mdi=st>0?100*sm/st:0, dx=(pdi+mdi)>0?100*Math.abs(pdi-mdi)/(pdi+mdi):0;
-    ax=ax===null?dx:al*dx+(1-al)*ax;
-  }
-  return ax;
-}
-/* BUY  : the last 2 candles touched the lower band, the last candle is bullish and closed back INSIDE the band,
-          RSI(14) hit 35 or lower on one of them and is now turning up.
-   SELL : the mirror image at the upper band (RSI 65 or higher, last candle bearish, closed back inside).
-   Anything else = WAIT.
-   Expiry is always 1 minute. */
+/* CALL (all 10 must be true on the completed signal candle):
+    1 close > EMA200   2 EMA9 > EMA21   3 EMA9 > EMA9 three candles ago   4 EMA21 > EMA21 three candles ago
+    5 low sweeps below the lowest low of the previous 5 candles   6 close back above that swept level
+    7 bullish candle   8 RSI > 50   9 RSI rising vs previous candle   10 range <= 2x average range of the previous 10 candles
+   PUT = the exact mirror. Only completed candles are used, nothing looks ahead, nothing is shifted back.
+   Entry reference = next candle open; the app enters at the live price when the signal appears. Expiry = 60 seconds. */
 function evaluateSetup(C1,p,C5){
   const o={valid:false,miss:[],why:[],signal:'WAIT'};
   const n=C1.length;
   if(n<MIN_C){ o.miss.push('not enough candles'); return o; }
-  const last=C1[n-1], prev=C1[n-2], B=bb(C1), Bp=bb(C1.slice(0,-1)), R=rsi(C1), Rp=rsi(C1.slice(0,-1));
-  if(!B||!Bp||R==null||Rp==null){ o.miss.push('not enough candles for indicators'); return o; }
+  const last=C1[n-1], prev=C1[n-2];
+  const e9=emaSeries(C1,EMA_F), e21=emaSeries(C1,EMA_M), e200=emaSeries(C1,EMA_T);
+  const R=rsi(C1), Rp=rsi(C1.slice(0,-1));
+  if(R==null||Rp==null){ o.miss.push('not enough candles for RSI'); return o; }
   o.rsi=R;
-  const buy =(last.l<=B.lo||prev.l<=Bp.lo)&&last.c>B.lo&&last.c>last.o&&Math.min(R,Rp)<=RSI_OS&&R>Rp;
-  const sell=(last.h>=B.up||prev.h>=Bp.up)&&last.c<B.up&&last.c<last.o&&Math.max(R,Rp)>=RSI_OB&&R<Rp;
-  if(buy) o.dir='BUY'; else if(sell) o.dir='SELL';
-  else { o.miss.push(`no band rejection (RSI ${R.toFixed(1)})`); return o; }
-  const isBuy=o.dir==='BUY';
-  /* ---- passed everything ---- */
-  o.kind=1; o.type='Band Rejection Reversal'; o.tf=TFS[0]; o.signal=isBuy?'BUY (CALL)':'SELL (PUT)'; o.valid=true;
-  const ext=isBuy?50-Math.min(R,Rp):Math.max(R,Rp)-50;       // how stretched RSI got
-  o.rank=ext;                                                 // most stretched RSI wins
+  const i=n-1;
+  const pre5=C1.slice(n-1-SWEEP_N,n-1), loLvl=Math.min(...pre5.map(x=>x.l)), hiLvl=Math.max(...pre5.map(x=>x.h));
+  const pre10=C1.slice(n-1-RANGE_N,n-1), avgRange=pre10.reduce((t,x)=>t+(x.h-x.l),0)/RANGE_N;
+  const range=last.h-last.l, calm=range<=RANGE_X*avgRange;
+  const call=[
+    ['close above EMA200', last.c>e200[i]],
+    ['EMA9 above EMA21', e9[i]>e21[i]],
+    ['EMA9 not rising', e9[i]>e9[i-SLOPE_N]],
+    ['EMA21 not rising', e21[i]>e21[i-SLOPE_N]],
+    ['no sweep below 5-bar low', last.l<loLvl],
+    ['did not close back above swept level', last.c>loLvl],
+    ['candle not bullish', last.c>last.o],
+    ['RSI not above 50', R>50],
+    ['RSI not rising', R>Rp],
+    ['candle range too large', calm]
+  ];
+  const put=[
+    ['close below EMA200', last.c<e200[i]],
+    ['EMA9 below EMA21', e9[i]<e21[i]],
+    ['EMA9 not falling', e9[i]<e9[i-SLOPE_N]],
+    ['EMA21 not falling', e21[i]<e21[i-SLOPE_N]],
+    ['no sweep above 5-bar high', last.h>hiLvl],
+    ['did not close back below swept level', last.c<hiLvl],
+    ['candle not bearish', last.c<last.o],
+    ['RSI not below 50', R<50],
+    ['RSI not falling', R<Rp],
+    ['candle range too large', calm]
+  ];
+  const cOK=call.every(x=>x[1]), pOK=put.every(x=>x[1]);
+  if(cOK) o.dir='BUY'; else if(pOK) o.dir='SELL';
+  else {
+    /* report the side that got furthest, with its first failed rule */
+    const cp=call.filter(x=>x[1]).length, pp=put.filter(x=>x[1]).length;
+    const side=cp>=pp?'CALL':'PUT', rules=cp>=pp?call:put, pass=Math.max(cp,pp);
+    const bad=rules.find(x=>!x[1]);
+    o.miss.push(`${side} ${pass}/10 rules · ${bad[0]}`); return o;
+  }
+  const isBuy=o.dir==='BUY', lvl=isBuy?loLvl:hiLvl;
+  o.kind=1; o.type='Liquidity Sweep Trend'; o.tf=TFS[0]; o.signal=isBuy?'BUY (CALL)':'SELL (PUT)'; o.valid=true;
+  const ext=Math.abs(R-50);                                   // momentum strength, used only to rank several valid markets
+  o.rank=ext;
   o.score=Math.max(5,Math.min(100,Math.round(50+ext)));       // bar length only, not a win probability
-  o.why.push('Setup: Band Rejection Reversal');
-  o.why.push(isBuy?`Price touched the lower band (${F(p,B.lo)}) and closed back inside at ${F(p,last.c)}`:`Price touched the upper band (${F(p,B.up)}) and closed back inside at ${F(p,last.c)}`);
-  o.why.push(`RSI(${RSI_N}) hit ${(isBuy?Math.min(R,Rp):Math.max(R,Rp)).toFixed(1)} and is turning (now ${R.toFixed(1)})`);
+  o.why.push('Setup: Liquidity Sweep Trend Continuation');
+  o.why.push(isBuy?`Uptrend: close ${F(p,last.c)} above EMA200 ${F(p,e200[i])}, EMA9 above EMA21 and both rising`:`Downtrend: close ${F(p,last.c)} below EMA200 ${F(p,e200[i])}, EMA9 below EMA21 and both falling`);
+  o.why.push(isBuy?`Swept the 5-bar low ${F(p,lvl)} (wick to ${F(p,last.l)}) and closed back above it, bullish candle`:`Swept the 5-bar high ${F(p,lvl)} (wick to ${F(p,last.h)}) and closed back below it, bearish candle`);
+  o.why.push(`RSI(${RSI_N}) ${R.toFixed(1)} and ${isBuy?'rising':'falling'} · range ${(range/avgRange).toFixed(1)}x the 10-bar average`);
   return o;
 }
 
@@ -440,7 +459,7 @@ function startSubs(){
   if(resolved) return; resolved=true;
   POOL.filter(p=>p.ok!==false).forEach((p,i)=>setTimeout(()=>{
     if(!wsOk) return; subscribe(p.s);
-    ws.send(JSON.stringify({ticks_history:p.s,adjust_start_time:1,count:300,end:'latest',style:'candles',granularity:60}));
+    ws.send(JSON.stringify({ticks_history:p.s,adjust_start_time:1,count:500,end:'latest',style:'candles',granularity:60}));
   },i*130));
 }
 setInterval(()=>{ if(wsOk) ws.send(JSON.stringify({ping:1})); },25000);
@@ -458,12 +477,12 @@ function intel(p,cut){
   const C=aggAt(cdl[p.s]||[],1,cut), n=C.length;
   if(n<MIN_C) return [{c:'rd',t:`READ  ${p.l} · ${n}/${MIN_C} candles, still collecting data`}];
   const C5=aggAt(cdl[p.s]||[],5,cut);
-  const r=C[n-1].c, B=bb(C), R=rsi(C), X=adx(C), R5=C5.length>RSI_N?rsi(C5):null;
+  const r=C[n-1].c, R=rsi(C), A=atr(C), e9=emaSeries(C,EMA_F), e21=emaSeries(C,EMA_M), e200=emaSeries(C,EMA_T), k=n-1;
   return [
-    {c:'rd',t:`READ  ${p.l} · ${n} 1m candles · ${C5.length} 5m candles · price ${F(p,r)}`},
-    {c:'ca',t:`CALC  Bollinger(${BB_N},${BB_K}) ${B?F(p,B.lo)+' – '+F(p,B.up):'--'}`},
-    {c:'ca',t:`CALC  RSI(${RSI_N}) ${R==null?'--':R.toFixed(1)} · ADX ${X==null?'--':X.toFixed(0)} · 5m RSI ${R5==null?'--':R5.toFixed(0)}`},
-    {c:'hn',t:`HUNT  band touch + rejection + RSI ${RSI_OS}/${RSI_OB}`}
+    {c:'rd',t:`READ  ${p.l} · ${n} 1m candles · price ${F(p,r)}`},
+    {c:'ca',t:`CALC  EMA9 ${F(p,e9[k])} · EMA21 ${F(p,e21[k])} · EMA200 ${F(p,e200[k])}`},
+    {c:'ca',t:`CALC  RSI(${RSI_N}) ${R==null?'--':R.toFixed(1)} · ATR(${ATR_N}) ${A==null?'--':F(p,A)}`},
+    {c:'hn',t:`HUNT  trend + 5-bar liquidity sweep + RSI 50 + calm candle`}
   ];
 }
 function beginScan(B){
@@ -483,7 +502,7 @@ function finalize(){
     const c1=cdl[p.s]||[], C1=aggAt(c1,1,Bsec), C5=aggAt(c1,5,Bsec);
     if(!C1.length||C1[C1.length-1].t!==Bsec-60){ mstat[p.s]={t:'no data',c:''}; why[p.s]='no candle for this minute'; return; }
     const r=evaluateSetup(C1,p,C5);
-    if(r.valid){ res.push({p,tf:r.tf,r}); mstat[p.s]={t:r.dir+(r.kind===1?' REV':' MID'),c:r.dir==='BUY'?'b':'s'}; }
+    if(r.valid){ res.push({p,tf:r.tf,r}); mstat[p.s]={t:r.dir+' SWEEP',c:r.dir==='BUY'?'b':'s'}; }
     else { mstat[p.s]={t:'wait',c:''}; why[p.s]=r.miss[0]||'conditions not met'; }
   });
   const valid=res.slice().sort((a,b)=>b.r.rank-a.r.rank);
@@ -613,7 +632,7 @@ function renderStats(){
       :wr>be?`<strong>Above break-even but not proven</strong> (95% low bound ${lo.toFixed(1)}%). Keep collecting data.`
       :`<strong>Below break-even.</strong> At this payout this strategy loses money. Change the logic or stop.`; }
   $('verdict').innerHTML=v;
-  $('byType').innerHTML=[['Band rejection',/^Band Rejection/]].map(([nm,re])=>{ const x=dn.filter(r=>re.test(r.type||'')), xw=x.filter(r=>r.st==='win').length;
+  $('byType').innerHTML=[['Liquidity sweep',/^Liquidity Sweep/]].map(([nm,re])=>{ const x=dn.filter(r=>re.test(r.type||'')), xw=x.filter(r=>r.st==='win').length;
     const rt=x.length?(xw/x.length*100).toFixed(1)+'%':'--', note=x.length&&x.length<30?' <i>(too few)</i>':'';
     return `<div style="display:flex;justify-content:space-between"><span>${nm}</span><span>${xw}/${x.length} &nbsp; <b>${rt}</b>${note}</span></div>`; }).join('');
   $('byExp').innerHTML=TFS.map(e=>{ const x=dn.filter(r=>r.expLabel===e.l), xw=x.filter(r=>r.st==='win').length;
