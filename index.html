@@ -281,9 +281,9 @@ function aggAt(c1,tf,Bsec){
   return out;
 }
 
-/* ---------- Strategy: Liquidity Sweep Trend Continuation (EMA 9/21/200 + 5-bar sweep + RSI 14). Closed 1m candles only. ---------- */
+/* ---------- Strategy: Liquidity Sweep Trend Continuation (EMA 9/21/200 + 3-bar sweep + RSI 14). Closed 1m candles only. ---------- */
 const F=(p,v)=>v==null||!isFinite(v)?'--':v.toFixed(p.d);
-const EMA_F=9, EMA_M=21, EMA_T=200, RSI_N=14, ATR_N=14, SWEEP_N=5, SLOPE_N=3, RANGE_N=10, RANGE_X=2;
+const EMA_F=9, EMA_M=21, EMA_T=200, RSI_N=14, ATR_N=14, SWEEP_N=3, SLOPE_N=2, RANGE_N=10, RANGE_X=3;
 /* AUTO_LOG: when true, a finished signal is scored automatically from the feed price at expiry (no popup), so scanning never waits for you.
    It scores the Deriv price, not your broker's price. Set false to tap Profit/Loss yourself after every signal. */
 const AUTO_LOG=true;
@@ -314,9 +314,9 @@ function atr(C,n=ATR_N){
   return a;
 }
 /* CALL (all 10 must be true on the completed signal candle):
-    1 close > EMA200   2 EMA9 > EMA21   3 EMA9 > EMA9 three candles ago   4 EMA21 > EMA21 three candles ago
-    5 low sweeps below the lowest low of the previous 5 candles   6 close back above that swept level
-    7 bullish candle   8 RSI > 50   9 RSI rising vs previous candle   10 range <= 2x average range of the previous 10 candles
+    1 close > EMA200   2 EMA9 > EMA21   3 EMA9 > EMA9 2 candles ago   4 EMA21 > EMA21 2 candles ago
+    5 low sweeps below the lowest low of the previous 3 candles   6 close back above that swept level
+    7 bullish candle   8 RSI > 50   9 RSI rising vs previous candle   10 range <= 3x average range of the previous 10 candles
    PUT = the exact mirror. Only completed candles are used, nothing looks ahead, nothing is shifted back.
    Entry reference = next candle open; the app enters at the live price when the signal appears. Expiry = 60 seconds. */
 function evaluateSetup(C1,p,C5){
@@ -337,7 +337,7 @@ function evaluateSetup(C1,p,C5){
     ['EMA9 above EMA21', e9[i]>e21[i]],
     ['EMA9 not rising', e9[i]>e9[i-SLOPE_N]],
     ['EMA21 not rising', e21[i]>e21[i-SLOPE_N]],
-    ['no sweep below 5-bar low', last.l<loLvl],
+    ['no sweep below 3-bar low', last.l<loLvl],
     ['did not close back above swept level', last.c>loLvl],
     ['candle not bullish', last.c>last.o],
     ['RSI not above 50', R>50],
@@ -349,7 +349,7 @@ function evaluateSetup(C1,p,C5){
     ['EMA9 below EMA21', e9[i]<e21[i]],
     ['EMA9 not falling', e9[i]<e9[i-SLOPE_N]],
     ['EMA21 not falling', e21[i]<e21[i-SLOPE_N]],
-    ['no sweep above 5-bar high', last.h>hiLvl],
+    ['no sweep above 3-bar high', last.h>hiLvl],
     ['did not close back below swept level', last.c<hiLvl],
     ['candle not bearish', last.c<last.o],
     ['RSI not below 50', R<50],
@@ -372,7 +372,7 @@ function evaluateSetup(C1,p,C5){
   o.score=Math.max(5,Math.min(100,Math.round(50+ext)));       // bar length only, not a win probability
   o.why.push('Setup: Liquidity Sweep Trend Continuation');
   o.why.push(isBuy?`Uptrend: close ${F(p,last.c)} above EMA200 ${F(p,e200[i])}, EMA9 above EMA21 and both rising`:`Downtrend: close ${F(p,last.c)} below EMA200 ${F(p,e200[i])}, EMA9 below EMA21 and both falling`);
-  o.why.push(isBuy?`Swept the 5-bar low ${F(p,lvl)} (wick to ${F(p,last.l)}) and closed back above it, bullish candle`:`Swept the 5-bar high ${F(p,lvl)} (wick to ${F(p,last.h)}) and closed back below it, bearish candle`);
+  o.why.push(isBuy?`Swept the 3-bar low ${F(p,lvl)} (wick to ${F(p,last.l)}) and closed back above it, bullish candle`:`Swept the 3-bar high ${F(p,lvl)} (wick to ${F(p,last.h)}) and closed back below it, bearish candle`);
   o.why.push(`RSI(${RSI_N}) ${R.toFixed(1)} and ${isBuy?'rising':'falling'} · range ${(range/avgRange).toFixed(1)}x the 10-bar average`);
   return o;
 }
@@ -482,7 +482,7 @@ function intel(p,cut){
     {c:'rd',t:`READ  ${p.l} · ${n} 1m candles · price ${F(p,r)}`},
     {c:'ca',t:`CALC  EMA9 ${F(p,e9[k])} · EMA21 ${F(p,e21[k])} · EMA200 ${F(p,e200[k])}`},
     {c:'ca',t:`CALC  RSI(${RSI_N}) ${R==null?'--':R.toFixed(1)} · ATR(${ATR_N}) ${A==null?'--':F(p,A)}`},
-    {c:'hn',t:`HUNT  trend + 5-bar liquidity sweep + RSI 50 + calm candle`}
+    {c:'hn',t:`HUNT  trend + 3-bar liquidity sweep + RSI 50 + calm candle`}
   ];
 }
 function beginScan(B){
